@@ -2,10 +2,12 @@
 Camera visualization helpers for PSF analysis.
 
 save_psf_2d  — side-by-side 2-D plot:
-    Left panel:  Blues, fixed to 0–4095 (cross-image comparison).
+    Left panel:  Blues, fixed to 0–max_value (cross-image comparison).
     Right panel: Blues, auto-scaled to [0, img.max()] (reveal fine features).
 
-save_psf_3d  — 3-D surface plot, Blues fixed to 0–4095.
+save_psf_3d  — 3-D surface plot, Blues fixed to 0–max_value.
+
+max_value is the sensor's full scale, e.g. 4095 for Mono12, 1023 for Mono10.
 
 Usage
 -----
@@ -28,11 +30,17 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 – registers the 3D proje
 # ---------------------------------------------------------------------------
 
 UINT12_MAX: int = 4095
-_CBAR_TICKS = [0, 1024, 2048, 3072, UINT12_MAX]
-_CBAR_LABEL = "Intensity (counts, 12-bit)"
+
+
+def _fixed_scale_ticks(max_value: int) -> list[int]:
+    return [int(round(v)) for v in np.linspace(0, max_value, 5)]
+
+
+def _cbar_label(max_value: int) -> str:
+    return f"Intensity (counts, {int(max_value).bit_length()}-bit)"
 
 # Default colormap for AlviumG1.plot(): black → blue → green.
-# Dark background keeps faint PSF wings visible; used with a fixed 0–4095 scale.
+# Dark background keeps faint PSF wings visible; used with a fixed full-scale range.
 PSF_CMAP = mcolors.LinearSegmentedColormap.from_list(
     "psf", ["black", "#0b3d91", "#00a0ff", "#00ff88"]
 )
@@ -46,11 +54,12 @@ def save_psf_2d(
     img: np.ndarray,
     save_path: Path,
     title: str = "",
+    max_value: int = UINT12_MAX,
 ) -> None:
     """
     Save a compact side-by-side 2-D PSF comparison plot as PNG.
 
-    Left panel:  Blues, fixed to 0–4095.  All captures share the same scale
+    Left panel:  Blues, fixed to 0–max_value.  All captures share the same scale
                  so brightness differences across snapshots are visible.
     Right panel: Blues, auto-scaled to [0, img.max()].  Stretches the
                  colormap to the peak of *this* image to reveal fine features
@@ -61,11 +70,13 @@ def save_psf_2d(
     Parameters
     ----------
     img : np.ndarray
-        Raw camera image (uint16, values 0–4095 for Mono12).
+        Raw camera image (uint16).
     save_path : Path
         Destination PNG path.
     title : str
         Optional figure title shown above both panels.
+    max_value : int
+        Full-scale value for the fixed panel (default 4095, i.e. Mono12).
     """
     img_max = int(img.max())
     auto_ticks = [int(round(v)) for v in np.linspace(0, img_max, 5)]
@@ -82,18 +93,18 @@ def save_psf_2d(
         constrained_layout=True,
     )
 
-    # --- Left: fixed range (0–4095) ---
+    # --- Left: fixed range (0–max_value) ---
     im_fixed = ax_fixed.imshow(
-        img, cmap="Blues", vmin=0, vmax=UINT12_MAX,
+        img, cmap="Blues", vmin=0, vmax=max_value,
         origin="upper", interpolation="nearest",
     )
     cbar_fixed = fig.colorbar(im_fixed, ax=ax_fixed, fraction=0.035, pad=0.03)
-    cbar_fixed.set_ticks(_CBAR_TICKS)
+    cbar_fixed.set_ticks(_fixed_scale_ticks(max_value))
     cbar_fixed.ax.tick_params(labelsize=7)
     ax_fixed.set_xlabel("x (pixels)", fontsize=8)
     ax_fixed.set_ylabel("y (pixels)", fontsize=8)
     ax_fixed.tick_params(labelsize=7)
-    ax_fixed.set_title(f"Fixed  (0 – {UINT12_MAX})", fontsize=9)
+    ax_fixed.set_title(f"Fixed  (0 – {max_value})", fontsize=9)
 
     # --- Right: auto-scaled to peak of this image ---
     im_auto = ax_auto.imshow(
@@ -125,18 +136,19 @@ def save_psf_3d(
     downsample: int = 4,
     z_percentile_low: float = 1.0,
     z_percentile_high: float = 99.9,
+    max_value: int = UINT12_MAX,
 ) -> None:
     """
     Save a 3-D surface PSF plot as PNG.
 
-    The surface is coloured with the same fixed PSF colormap (0–4095).
+    The surface is coloured with the same fixed PSF colormap (0–max_value).
     The Z axis is trimmed to the data's own dynamic range so the relief is
     clearly visible even for weak PSFs.
 
     Parameters
     ----------
     img : np.ndarray
-        Raw camera image (uint16, values 0–4095 for Mono12).
+        Raw camera image (uint16).
     save_path : Path
         Destination PNG path.
     title : str
@@ -149,6 +161,8 @@ def save_psf_3d(
     z_percentile_high : float
         Upper percentile used to set the Z axis ceiling (default 99.9).
         Keeps the relief visible without being dominated by hot pixels.
+    max_value : int
+        Full-scale value for the colour normalisation (default 4095, i.e. Mono12).
     """
     ds = max(1, int(downsample))
     sub = img[::ds, ::ds].astype(np.float32)
@@ -159,8 +173,8 @@ def save_psf_3d(
     y = np.arange(h) * ds
     X, Y = np.meshgrid(x, y)
 
-    # Face colours: fixed 0–4095 normalisation
-    norm = mcolors.Normalize(vmin=0, vmax=UINT12_MAX)
+    # Face colours: fixed 0–max_value normalisation
+    norm = mcolors.Normalize(vmin=0, vmax=max_value)
     face_colors = plt.cm.Blues(norm(sub))
 
     # Z axis: show only the relevant relief portion
@@ -191,8 +205,8 @@ def save_psf_3d(
     sm = plt.cm.ScalarMappable(cmap="Blues", norm=norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax, shrink=0.5, aspect=10, pad=0.1)
-    cbar.set_label(_CBAR_LABEL, fontsize=9)
-    cbar.set_ticks(_CBAR_TICKS)
+    cbar.set_label(_cbar_label(max_value), fontsize=9)
+    cbar.set_ticks(_fixed_scale_ticks(max_value))
 
     if title:
         ax.set_title(title, fontsize=10)

@@ -32,7 +32,8 @@ class AlviumG1:
     """
 
     # ---------- Pixel format ----------
-    PX_FORMAT = vpy.PixelFormat.Mono12
+    # Candidates for pixel_format="auto", highest bit depth first
+    _MONO_FORMATS = ("Mono16", "Mono14", "Mono12", "Mono10", "Mono8")
 
     # ---------- Declarative parameter registry ----------
     _PARAMETERS = {
@@ -45,7 +46,7 @@ class AlviumG1:
         #     "setter": "set_access_mode",
         # },
         "pixel_format": {
-            "default": "Mono12",
+            "default": "auto",
             "setter": "set_pixel_format",
         },
         "gain_auto": {
@@ -87,6 +88,9 @@ class AlviumG1:
             gain_db : float or None
             exposure_auto : bool or None
             gain_auto : bool or None
+            pixel_format : str or None
+                "auto" (highest Mono bit depth the camera supports) or an
+                explicit format such as "Mono8", "Mono10", "Mono12".
         """
         # Store config
         self._cfg = config
@@ -105,15 +109,23 @@ class AlviumG1:
 
         self.vmb = self._vmb_ctx
 
-        self._connect_camera()
-        self._last_timestamp = None
+        try:
+            self._connect_camera()
+            self._last_timestamp = None
 
-        # Apply user configuration (sets camera state)
-        self._camera_metadata = {}
-        self._apply_initial_settings()
+            # Apply user configuration (sets camera state)
+            self._camera_metadata = {}
+            self._apply_initial_settings()
 
-        # ---- Metadata cache (must come LAST) ----
-        self._camera_metadata = self._query_static_metadata()
+            # ---- Metadata cache (must come LAST) ----
+            self._camera_metadata = self._query_static_metadata()
+        except Exception:
+            # Release Vimba before re-raising, otherwise its threads keep Python from exiting
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
     # ---------- Camera connection ----------
 
@@ -124,9 +136,16 @@ class AlviumG1:
         if self.camera_id is not None:
             self.cam = self.vmb.get_camera_by_id(self.camera_id)
         else:
-            cams = self.vmb.get_all_cameras()
+            # Ignore the fake cameras from the Vimba X Camera Simulator
+            cams = [
+                c for c in self.vmb.get_all_cameras()
+                if "Simulator" not in c.get_interface_id()
+            ]
             if not cams:
-                raise RuntimeError("No Allied Vision cameras found.")
+                raise RuntimeError(
+                    "No Allied Vision cameras found. Check the camera is plugged in "
+                    "and not open in another program (e.g. Vimba X Viewer)."
+                )
             #here I decide which amera gets connected might need to be changed eventually
             self.cam = cams[0]
             self.camera_id = self.cam.get_id()
@@ -145,13 +164,16 @@ class AlviumG1:
         self._uncrop_camera()
 
     def close(self):
-        if hasattr(self, "cam"):
-            self.set_pixel_format("Mono8")
-            self.cam._close()
-
-        if hasattr(self, "_vmb_ctx"):
-
-            self._vmb_ctx._shutdown()  # <-- NOT __exit__()
+        try:
+            if hasattr(self, "cam"):
+                try:
+                    self.cam.set_pixel_format(vpy.PixelFormat.Mono8)
+                except vpy.VmbError:
+                    pass
+                self.cam._close()
+        finally:
+            if hasattr(self, "_vmb_ctx"):
+                self._vmb_ctx._shutdown()  # <-- NOT __exit__()
 
 
     # ---------- Declarative configuration ----------
@@ -241,14 +263,15 @@ class AlviumG1:
         """
         metadata = {
             "camera_id": self.camera_id,
-            "pixel_format": str(self.PX_FORMAT),
+            "pixel_format": str(self.px_format),
+            "bit_depth": self.bit_depth,
 
             "resolution": [
                 int(self.cam.SensorHeight.get()),
                 int(self.cam.SensorWidth.get()),
             ],
 
-            "exposure_us": float(self.cam.ExposureTime.get()),
+            "exposure_us": float(self._feature(self._EXPOSURE_TIME).get()),
             "gain_db": float(self.cam.Gain.get()),
             "exposure_auto": str(self.cam.ExposureAuto.get()),
             "gain_auto": str(self.cam.GainAuto.get()),
@@ -257,12 +280,26 @@ class AlviumG1:
 
     # ---------- Parameter wrappers (update cache) ----------
 
+    # Features whose name differs between camera families: (Alvium, Mako)
+    _EXPOSURE_TIME = ("ExposureTime", "ExposureTimeAbs")
+
+    def _feature(self, names: tuple):
+        """
+        Return the first feature in `names` that this camera provides.
+        """
+        for name in names:
+            try:
+                return self.cam.get_feature_by_name(name)
+            except vpy.VmbFeatureError:
+                pass
+        raise AttributeError(f"Camera '{self.camera_id}' has none of the features {names}")
+
     def set_exposure(self, exposure_us: float):
         """
         Set camera exposure time (microseconds).
         """
         self.cam.ExposureAuto.set("Off")
-        self.cam.ExposureTime.set(exposure_us)
+        self._feature(self._EXPOSURE_TIME).set(exposure_us)
 
         self._camera_metadata["exposure_us"] = exposure_us
         self._camera_metadata["exposure_auto"] = False
@@ -294,18 +331,36 @@ class AlviumG1:
         self.cam.GainAuto.set("Continuous" if enabled else "Off")
         self._camera_metadata["gain_auto"] = enabled
 
-    def set_pixel_format(self, format="Mono12"):
+    def set_pixel_format(self, format="auto"):
         """
         Set camera pixel format.
-        """
-        try:
-            if format == "Mono12":
-                self.cam.set_pixel_format(self.PX_FORMAT)
-            elif format == "Mono8":
-                self.cam.set_pixel_format(vpy.PixelFormat.Mono8)
 
-        except vpy.VmbFeatureError:
-            pass
+        "auto" picks the highest Mono bit depth the camera supports.
+        An explicit name (e.g. "Mono10") must be supported by the camera.
+        """
+        supported = {str(f) for f in self.cam.get_pixel_formats()}
+        mono_supported = [f for f in self._MONO_FORMATS if f in supported]
+
+        if format == "auto":
+            if not mono_supported:
+                raise RuntimeError(
+                    f"Camera supports no Mono pixel format. Available: {sorted(supported)}"
+                )
+            format = mono_supported[0]
+        elif format not in supported:
+            raise ValueError(
+                f"Pixel format '{format}' not supported by this camera. "
+                f"Mono formats available: {mono_supported}"
+            )
+
+        self.px_format = getattr(vpy.PixelFormat, format)
+        self.cam.set_pixel_format(self.px_format)
+
+        self.bit_depth = int(format.removeprefix("Mono"))
+        self.max_value = 2 ** self.bit_depth - 1
+        self._camera_metadata["pixel_format"] = format
+        self._camera_metadata["bit_depth"] = self.bit_depth
+        print(f"[Camera] Pixel format: {format} ({self.bit_depth}-bit)")
 
     def set_access_mode(self, mode="Full"):
         """
@@ -326,14 +381,15 @@ class AlviumG1:
         Returns
         -------
         np.ndarray
-            Raw camera image (uint16).
+            Raw camera image (uint16, values 0 to self.max_value).
         """
 
         prev_mode = self.cam.AcquisitionMode.get()
         self.cam.AcquisitionMode.set("Continuous")
 
         frame = self.cam.get_frame(timeout_ms=2000)
-        frame = frame.convert_pixel_format(self.PX_FORMAT)
+        if frame.get_pixel_format() != self.px_format:
+            frame = frame.convert_pixel_format(self.px_format)
 
         self.cam.AcquisitionMode.set(prev_mode)
 
@@ -408,12 +464,14 @@ class AlviumG1:
                 img,
                 base_dir / f"{preview_stem}.png",
                 title=f"{experiment_name}\n{timestamp}",
+                max_value=self.max_value,
             )
             if plot_psf_3d:
                 save_psf_3d(
                     img,
                     base_dir / f"preview_3d_{filename}_{timestamp}.png" if filename is not None else base_dir / f"preview_3d_{timestamp}.png",
                     title=f"{experiment_name}\n{timestamp}",
+                    max_value=self.max_value,
                 )
             # --- Legacy B&W PNG (replaced by PSF colormap above) ---
             # preview = img.astype(np.float32)
@@ -464,11 +522,11 @@ class AlviumG1:
             Explicit path to a .npy file.
         cmap : matplotlib colormap or None
             Colormap to use.  Defaults to PSF_CMAP (black → blue → green)
-            with a fixed 0–4095 linear scale.  Pass any matplotlib colormap
-            to override.
+            with a fixed 0 to self.max_value linear scale.  Pass any
+            matplotlib colormap to override.
 
         """
-        from .camera_plot_helpers import PSF_CMAP, UINT12_MAX
+        from .camera_plot_helpers import PSF_CMAP
         if cmap is None:
             cmap = PSF_CMAP
 
@@ -506,13 +564,13 @@ class AlviumG1:
             img,
             cmap=cmap,
             vmin=0,
-            vmax=UINT12_MAX,
+            vmax=self.max_value,
             origin="upper",
             interpolation="nearest",
         )
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label("Intensity (counts, 12-bit)", fontsize=10)
-        cbar.set_ticks([0, 1024, 2048, 3072, UINT12_MAX])
+        cbar.set_label(f"Intensity (counts, {self.bit_depth}-bit)", fontsize=10)
+        cbar.set_ticks(np.linspace(0, self.max_value, 5).round().astype(int))
         ax.set_xlabel("x (pixels)")
         ax.set_ylabel("y (pixels)")
 

@@ -164,7 +164,7 @@ img, out_dir = cam.snapshot(
 cam.close()
 ```
 
-`img` is a `uint16` NumPy array (Mono12, values 0–4095). `out_dir` is the directory the snapshot was written to.
+`img` is a `uint16` NumPy array with values from 0 to `cam.max_value` (e.g. 4095 for Mono12, 1023 for Mono10). `out_dir` is the directory the snapshot was written to.
 
 ### Output layout
 
@@ -188,7 +188,7 @@ Passed as a dict to `AlviumG1(config)`. Only `data_root` is required; every othe
 | `gain_db` | `0.0` | Analog gain in dB. Ignored if `gain_auto` is `True`. |
 | `exposure_auto` | `False` | Continuous auto-exposure. |
 | `gain_auto` | `False` | Continuous auto-gain. |
-| `pixel_format` | `"Mono12"` | `"Mono12"` or `"Mono8"`. |
+| `pixel_format` | `"auto"` | `"auto"` picks the highest Mono bit depth the camera supports (Mono16 → Mono8). Or name one explicitly, e.g. `"Mono10"`; an unsupported format raises `ValueError` listing what the camera offers. |
 
 ## API
 
@@ -210,7 +210,7 @@ Usable standalone on any 2-D array — no camera required:
 ```python
 from allied_vision import save_psf_2d, save_psf_3d
 
-save_psf_2d(img, "preview.png", title="PSF")   # side-by-side fixed 0–4095 / auto-scaled
+save_psf_2d(img, "preview.png", title="PSF", max_value=cam.max_value)   # side-by-side fixed full-scale / auto-scaled
 save_psf_3d(img, "preview_3d.png", title="PSF")  # 3-D surface
 ```
 
@@ -320,7 +320,7 @@ parent push when the submodule commit is unpublished — worth setting as a habi
 
 ## Known constraints
 
-- **12-bit / Mono12 is assumed throughout.** The `UINT12_MAX = 4095` ceiling is baked into the plot scaling, and `capture_frame()` takes channel 0 of the converted frame.
+- **Mono (greyscale) formats only.** Plot scaling follows the selected bit depth (`cam.max_value`); `save_psf_2d` / `save_psf_3d` default to 4095 when called directly without `max_value`. `capture_frame()` takes channel 0 of the frame.
 - Frame timeout is fixed at 2000 ms.
 - Status messages go to `stdout` via `print()`, not the `logging` module.
 - Only one camera is opened per `AlviumG1` instance; with no `camera_id` it takes whichever camera enumerates first.
