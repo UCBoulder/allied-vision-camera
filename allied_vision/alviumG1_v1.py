@@ -88,6 +88,9 @@ class AlviumG1:
             gain_db : float or None
             exposure_auto : bool or None
             gain_auto : bool or None
+            use_camera_roi : bool
+                True (default) keeps the AOI the camera already has, e.g. one
+                set in Vimba X Viewer. False resets to the full sensor.
             pixel_format : str or None
                 "auto" (highest Mono bit depth the camera supports) or an
                 explicit format such as "Mono8", "Mono10", "Mono12".
@@ -161,7 +164,18 @@ class AlviumG1:
                 f"  Close that application and run again.\n"
                 f"  Underlying error: {exc}"
             ) from exc
-        self._uncrop_camera()
+
+        # Keep whatever AOI the camera already has (e.g. set in Vimba X Viewer)
+        # unless the caller asked for the full sensor.
+        if self._cfg.get("use_camera_roi", True):
+            offx, offy, w, h = self.get_roi()
+            if (w, h) != (self.cam.Width.get_range()[1], self.cam.Height.get_range()[1]):
+                print(f"[Camera] Using the camera's ROI: {w}x{h} at ({offx}, {offy}). "
+                      f"Set use_camera_roi=False for the full sensor.")
+            else:
+                print(f"AOI: {w} {h} {offx} {offy}")
+        else:
+            self._uncrop_camera()
 
     def close(self):
         try:
@@ -177,6 +191,30 @@ class AlviumG1:
 
 
     # ---------- Declarative configuration ----------
+
+    def get_roi(self) -> tuple[int, int, int, int]:
+        """
+        Current area of interest as (offset_x, offset_y, width, height), in pixels.
+        """
+        return (
+            int(self.cam.OffsetX.get()),
+            int(self.cam.OffsetY.get()),
+            int(self.cam.Width.get()),
+            int(self.cam.Height.get()),
+        )
+
+    def set_roi(self, offset_x: int, offset_y: int, width: int, height: int):
+        """
+        Set the area of interest directly, in the order the Alvium requires
+        (offsets to zero, then size, then offsets).
+        """
+        self.cam.OffsetX.set(self.cam.OffsetX.get_range()[0])
+        self.cam.OffsetY.set(self.cam.OffsetY.get_range()[0])
+        self.cam.Width.set(int(width))
+        self.cam.Height.set(int(height))
+        self.cam.OffsetX.set(int(offset_x))
+        self.cam.OffsetY.set(int(offset_y))
+
     def _uncrop_camera(self):
         # Reset offsets first (many cameras require this order)
         offx_min, offx_max = self.cam.OffsetX.get_range()
@@ -431,13 +469,17 @@ class AlviumG1:
             self.set_exposure(exposure_time_us)
             print("set exposure time to given value", exposure_time_us)
 
+        # With no cropping_params the camera's current ROI is used as-is
+        previous_roi = self.get_roi()
         if cropping_params is not None:
             self._crop_camera(**cropping_params)
         try:
+            roi_used = self.get_roi()
             img = self.capture_frame()
         finally:
             if cropping_params is not None:
-                self._uncrop_camera()
+                # Put back whatever ROI was set before, rather than uncropping
+                self.set_roi(*previous_roi)
 
         if exposure_time_us is not None:
             exposure_us = self._cfg.get("exposure_us")
@@ -482,8 +524,17 @@ class AlviumG1:
             # preview = (preview * 65535).astype(np.uint16)
             # cv.imwrite(str(base_dir / f"{preview_stem}.png"), preview)
         if save_metadata :
+            offset_x, offset_y, roi_w, roi_h = roi_used
             metadata = {
                 **self._camera_metadata,
+                # AOI this frame was taken with: needed to map pixel positions
+                # back to sensor coordinates when the camera is cropped.
+                "roi": {
+                    "offset_x": offset_x,
+                    "offset_y": offset_y,
+                    "width": roi_w,
+                    "height": roi_h,
+                },
                 "timestamp": timestamp,
                 "comment": comment,
             }
